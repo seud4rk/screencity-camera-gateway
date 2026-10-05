@@ -16,6 +16,7 @@ const PRODUCER_TOKEN = process.env.PRODUCER_TOKEN || ''
 const VIEWER_TOKEN = process.env.VIEWER_TOKEN || ''
 const cameras = new Map()
 const demand = new Map()
+const startedAt = Date.now()
 
 const CAMERA_NAMES = {
   'camera-teste-01': ['Câmera 01','Bancada / Teste'],
@@ -33,22 +34,29 @@ function producer(req,res,next){
   next()
 }
 function viewer(req,res,next){
-  if(!VIEWER_TOKEN) return next() // piloto: leitura pública somente se VIEWER_TOKEN não foi definido
+  if(!VIEWER_TOKEN) return next()
   if(!safeEqual(req.get('x-viewer-token')||req.query.token,VIEWER_TOKEN)) return res.status(401).json({error:'não autorizado'})
   next()
 }
 function row(id){
-  if(!cameras.has(id)) cameras.set(id,{id,lastSeen:0,lastFrameAt:0,frame:null,connected:false,sd:null})
+  if(!cameras.has(id)) cameras.set(id,{id,lastSeen:0,lastFrameAt:0,frame:null,connected:false,sd:null,telemetry:{},frameCount:0})
   return cameras.get(id)
 }
 function status(id){
   const c=row(id), meta=CAMERA_NAMES[id]||[id,'']
-  const online=Date.now()-c.lastSeen<20000
+  const now=Date.now()
+  const online=now-c.lastSeen<20000
+  const frameAge=c.lastFrameAt?now-c.lastFrameAt:null
+  const until=demand.get(id)||0
   return {
     id, name:meta[0], group:meta[1], online,
     p2p_connected: !!c.connected,
+    live_requested: until>now,
     last_seen:c.lastSeen?new Date(c.lastSeen).toISOString():null,
     last_frame_at:c.lastFrameAt?new Date(c.lastFrameAt).toISOString():null,
+    frame_age_ms:frameAge,
+    frame_count:c.frameCount,
+    telemetry:c.telemetry||{},
     sd:c.sd||null,
     snapshot_url:c.frame?`/api/cameras/${id}/snapshot`:null,
     live_url:online?`/api/cameras/${id}/live.mjpg`:null,
@@ -56,24 +64,26 @@ function status(id){
   }
 }
 
-app.get('/health',(_req,res)=>res.json({ok:true,service:'ScreenCity Camera Gateway',time:new Date().toISOString()}))
+app.get('/health',(_req,res)=>res.json({ok:true,service:'ScreenCity Camera Gateway',phase:4,uptime_s:Math.floor((Date.now()-startedAt)/1000),time:new Date().toISOString()}))
 
 app.post('/producer/heartbeat/:id', producer, (req,res)=>{
   const id=req.params.id
   if(!CAMERA_NAMES[id]) return res.status(404).json({error:'câmera desconhecida'})
   const c=row(id); c.lastSeen=Date.now()
   c.connected=!!req.body?.connected
+  c.telemetry={...(c.telemetry||{}),...(req.body||{})}
   if(req.body?.sd) c.sd=req.body.sd
   res.json({ok:true,demandUntil:demand.get(id)||0})
 })
 
 app.get('/producer/command', producer, (_req,res)=>{
   const now=Date.now()
-  const requested=Object.entries(CAMERA_NAMES)
-    .map(([id])=>({id,until:demand.get(id)||0}))
+  const requested=Object.keys(CAMERA_NAMES)
+    .map(id=>({id,until:demand.get(id)||0}))
     .filter(x=>x.until>now)
     .sort((a,b)=>b.until-a.until)[0] || null
-  res.json({camera_id:requested?.id||null,live_requested:!!requested})
+  res.set('Cache-Control','no-store')
+  res.json({camera_id:requested?.id||null,live_requested:!!requested,server_time:now})
 })
 
 app.post('/producer/frame/:id', producer, (req,res)=>{
@@ -81,19 +91,27 @@ app.post('/producer/frame/:id', producer, (req,res)=>{
   if(!CAMERA_NAMES[id]) return res.status(404).end()
   if(!Buffer.isBuffer(req.body)||req.body.length<100) return res.status(400).end()
   const c=row(id)
-  c.frame=Buffer.from(req.body); c.lastFrameAt=Date.now(); c.lastSeen=Date.now(); c.connected=true
+  c.frame=Buffer.from(req.body); c.lastFrameAt=Date.now(); c.lastSeen=Date.now(); c.connected=true; c.frameCount++
   res.status(204).end()
 })
 
 app.get('/api/cameras/status', viewer, (_req,res)=>{
-  res.json({cameras:Object.keys(CAMERA_NAMES).map(status)})
+  res.set('Cache-Control','no-store')
+  res.json({phase:4,server_time:new Date().toISOString(),cameras:Object.keys(CAMERA_NAMES).map(status)})
 })
 
 app.post('/api/cameras/:id/request-live', viewer, (req,res)=>{
   const id=req.params.id
   if(!CAMERA_NAMES[id]) return res.status(404).json({error:'câmera desconhecida'})
-  demand.set(id,Date.now()+45000)
+  demand.set(id,Date.now()+60000)
   res.json({ok:true,camera:status(id),demand_until:new Date(demand.get(id)).toISOString()})
+})
+
+app.post('/api/cameras/:id/keep-live', viewer, (req,res)=>{
+  const id=req.params.id
+  if(!CAMERA_NAMES[id]) return res.status(404).json({error:'câmera desconhecida'})
+  demand.set(id,Date.now()+30000)
+  res.json({ok:true,demand_until:new Date(demand.get(id)).toISOString()})
 })
 
 app.post('/api/cameras/:id/stop-live', viewer, (req,res)=>{
@@ -103,19 +121,22 @@ app.post('/api/cameras/:id/stop-live', viewer, (req,res)=>{
 app.get('/api/cameras/:id/snapshot', viewer, (req,res)=>{
   const c=row(req.params.id)
   if(!c.frame) return res.status(404).end()
-  res.set({'Content-Type':'image/jpeg','Cache-Control':'no-store'})
+  res.set({'Content-Type':'image/jpeg','Cache-Control':'no-store, no-cache, must-revalidate'})
   res.end(c.frame)
 })
 
 app.get('/api/cameras/:id/live.mjpg', viewer, (req,res)=>{
   const id=req.params.id
   if(!CAMERA_NAMES[id]) return res.status(404).end()
-  demand.set(id,Date.now()+45000)
+  demand.set(id,Date.now()+60000)
   res.writeHead(200,{
     'Content-Type':'multipart/x-mixed-replace; boundary=frame',
     'Cache-Control':'no-store, no-cache, must-revalidate',
-    'Connection':'keep-alive'
+    'Pragma':'no-cache',
+    'Connection':'keep-alive',
+    'X-Accel-Buffering':'no'
   })
+  if(res.flushHeaders) res.flushHeaders()
   let last=0
   const timer=setInterval(()=>{
     demand.set(id,Date.now()+15000)
@@ -124,8 +145,8 @@ app.get('/api/cameras/:id/live.mjpg', viewer, (req,res)=>{
     last=c.lastFrameAt
     res.write(`--frame\r\nContent-Type: image/jpeg\r\nContent-Length: ${c.frame.length}\r\n\r\n`)
     res.write(c.frame); res.write('\r\n')
-  },250)
+  },100)
   req.on('close',()=>{clearInterval(timer); demand.delete(id)})
 })
 
-app.listen(PORT,()=>console.log(`ScreenCity Camera Gateway na porta ${PORT}`))
+app.listen(PORT,()=>console.log(`ScreenCity Camera Gateway Fase 4 na porta ${PORT}`))
